@@ -31,22 +31,74 @@
 INSTANTIATE_ALGORITHM(interval_indexer::interval_indexer_t) // This is a macro that instantiates the algorithm in the Allen namespace
 
 // Constants 
-void interval_indexer::interval_indexer_t::set_arguments_size(
+
+__host__ void interval_indexer::interval_indexer_t::set_arguments_size(
   ArgumentReferences<Parameters> arguments,
   const RuntimeOptions&,
   const Constants&) const
 {
-  auto host_number_of_events = first<host_number_of_events_t>(arguments); // Get the number of events from the arguments on the host
-  auto dev_offsets_all_velo_tracks = data<dev_offsets_all_velo_tracks_t>(arguments); // Get the offsets of all velo tracks from the arguments on the device
-  
-  unsigned total_tracks = dev_offsets_all_velo_tracks[host_number_of_events]; // Get the total number of tracks from the offsets of all velo tracks
-  
-  set_size<dev_intervals_t>(arguments, total_tracks * 3); // Set the size of the intervals array
-  set_size<dev_interval_counts_t>(arguments, total_tracks); // Set the size of the interval counts array
-  set_size<dev_sorted_track_indices_t>(arguments, total_tracks); // Set the size of the sorted track indices array
-  set_size<dev_ellipsoid_params_t>(arguments, total_tracks * 6); // Set the size of the ellipsoid parameters array
-  set_size<dev_z_pocas_t>(arguments, total_tracks); // Set the size of the z_pocas array
-  set_size<dev_track_indices_t>(arguments, total_tracks); // Set the size of the track indices array
+  printf("Entering set_arguments_size function\n");
+
+  // Get the number of events from the arguments on the host
+  auto host_number_of_events = first<host_number_of_events_t>(arguments);
+  printf("host_number_of_events: %u\n", host_number_of_events);
+
+  // Get the offsets of all velo tracks from the arguments
+  auto dev_offsets_all_velo_tracks = data<dev_offsets_all_velo_tracks_t>(arguments);
+  printf("dev_offsets_all_velo_tracks pointer: %p\n", (void*)dev_offsets_all_velo_tracks);
+
+  // Check if dev_offsets_all_velo_tracks is valid
+  if (dev_offsets_all_velo_tracks == nullptr) {
+    printf("Error: dev_offsets_all_velo_tracks is null\n");
+    return;
+  }
+
+  // Get total_tracks
+  unsigned total_tracks = 0;
+  #ifdef __CUDACC__
+    // GPU version
+    cudaError_t cuda_err = cudaMemcpy(&total_tracks, &dev_offsets_all_velo_tracks[host_number_of_events], sizeof(unsigned), cudaMemcpyDeviceToHost);
+    if (cuda_err != cudaSuccess) {
+      printf("CUDA error when copying total_tracks: %s\n", cudaGetErrorString(cuda_err));
+      return;
+    }
+  #else
+    // CPU version
+    total_tracks = dev_offsets_all_velo_tracks[host_number_of_events];
+  #endif
+  printf("total_tracks: %u\n", total_tracks);
+
+  // Check for potential overflow when calculating sizes
+  if (total_tracks > (UINT_MAX / 3) || total_tracks > (UINT_MAX / 6)) {
+    printf("Error: Potential integer overflow when calculating sizes\n");
+    return;
+  }
+
+  // Set the size of the intervals array
+  printf("Setting size for dev_intervals_t: %u\n", total_tracks * 3);
+  set_size<dev_intervals_t>(arguments, total_tracks * 3);
+
+  // Set the size of the interval counts array
+  printf("Setting size for dev_interval_counts_t: %u\n", total_tracks);
+  set_size<dev_interval_counts_t>(arguments, total_tracks);
+
+  // Set the size of the sorted track indices array
+  printf("Setting size for dev_sorted_track_indices_t: %u\n", total_tracks);
+  set_size<dev_sorted_track_indices_t>(arguments, total_tracks);
+
+  // Set the size of the ellipsoid parameters array
+  printf("Setting size for dev_ellipsoid_params_t: %u\n", total_tracks * 6);
+  set_size<dev_ellipsoid_params_t>(arguments, total_tracks * 6);
+
+  // Set the size of the z_pocas array
+  printf("Setting size for dev_z_pocas_t: %u\n", total_tracks);
+  set_size<dev_z_pocas_t>(arguments, total_tracks);
+
+  // Set the size of the track indices array
+  printf("Setting size for dev_track_indices_t: %u\n", total_tracks);
+  set_size<dev_track_indices_t>(arguments, total_tracks);
+
+  printf("Exiting set_arguments_size function\n");
 }
 
 // Main function for the Algorithm
@@ -250,12 +302,22 @@ HOST_DEVICE void interval_indexer::calculate_ellipsoid_params(
 // Kernel function for interval indexing and ellipsoid parameter calculation
 __global__ void interval_indexer::interval_indexer(Parameters parameters)
 {  
+    printf("Entering interval_indexer kernel\n");
+
     // Get the current event number from the block index
     const unsigned event_number = blockIdx.x;
+    printf("event_number: %u\n", event_number);
+
     // Get the total number of events from the parameters
     const unsigned number_of_events = parameters.dev_number_of_events[0];
+    printf("number_of_events: %u\n", number_of_events);
+
     // Early exit if this block is beyond the number of events
-    if (event_number >= number_of_events) return;
+    if (event_number >= number_of_events) {
+        printf("Early exit: event_number (%u) >= number_of_events (%u)\n", event_number, number_of_events);
+        return;
+    }
+
     // Get views for VELO tracks and states for the current event
     const auto velo_tracks_view = parameters.dev_velo_tracks_view[event_number];
     const auto velo_states_view = parameters.dev_velo_states_view[event_number];
