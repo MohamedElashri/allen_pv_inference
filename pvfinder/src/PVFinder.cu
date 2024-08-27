@@ -1,3 +1,15 @@
+/*****************************************************************************\
+* (c) Copyright 2018-2020 CERN for the benefit of the LHCb Collaboration      *
+*                                                                             *
+* This software is distributed under the terms of the Apache License          *
+* version 2 (Apache-2.0), copied verbatim in the file "LICENSE".              *
+*                                                                             *
+* In applying this licence, CERN does not waive the privileges and immunities *
+* granted to it by virtue of its status as an Intergovernmental Organization  *
+* or submit itself to any jurisdiction.                                       *
+\*****************************************************************************/
+
+
 #include "PVFinder.cuh"
 #include <algorithm>
 #include <fstream>
@@ -6,10 +18,64 @@
 #include <stdexcept>
 #include <iostream>
 #include <chrono>
+#include <cstdlib>  // For getenv
+
+
 
 INSTANTIATE_ALGORITHM(PVFinder::PVFinder_t)
 
 namespace PVFinder {
+
+// Function to save A-E parameters to a CSV file
+void save_extended_params_to_csv(
+    const std::string& file_name,
+    const std::vector<float>& ellipsoid_params_data,
+    const std::vector<float>& major_axes_data,
+    const std::vector<float>& minor_axes_data,
+    const std::vector<float>& poca_data,
+    unsigned num_events,
+    unsigned max_tracks) 
+{
+    std::ofstream outfile(file_name);
+    if (!outfile.is_open()) {
+        throw std::runtime_error("Unable to open file: " + file_name);
+    }
+
+    // Write the header
+    outfile << "Event,Track,A,B,C,D,E,F,Major_X,Major_Y,Major_Z,Minor1_X,Minor1_Y,Minor1_Z,Minor2_X,Minor2_Y,Minor2_Z,POCA_X,POCA_Y,POCA_Z" << std::endl;
+
+    // Write the parameters
+    for (unsigned event = 0; event < num_events; ++event) {
+        for (unsigned track = 0; track < max_tracks; ++track) {
+            unsigned idx = (event * max_tracks + track);
+            outfile << event << "," << track;
+
+            // Ellipsoid parameters (A-F)
+            for (unsigned j = 0; j < 6; ++j) {
+                outfile << "," << ellipsoid_params_data[idx * 6 + j];
+            }
+
+            // Major axis
+            for (unsigned j = 0; j < 3; ++j) {
+                outfile << "," << major_axes_data[idx * 3 + j];
+            }
+
+            // Minor axes (2 minor axes, 3 components each)
+            for (unsigned j = 0; j < 6; ++j) {
+                outfile << "," << minor_axes_data[idx * 6 + j];
+            }
+
+            // POCA coordinates
+            for (unsigned j = 0; j < 3; ++j) {
+                outfile << "," << poca_data[idx * 3 + j];
+            }
+
+            outfile << std::endl;
+        }
+    }
+
+    outfile.close();
+}
 
 std::vector<float> read_txt_file(const std::string& file_path) {
     std::vector<float> data;
@@ -23,17 +89,10 @@ std::vector<float> read_txt_file(const std::string& file_path) {
         data.push_back(value);
     }
     
-    std::cout << "First few values from " << file_path << ":" << std::endl;
-    for (size_t i = 0; i < std::min(data.size(), size_t(5)); ++i) {
-        std::cout << data[i] << " ";
-    }
-    std::cout << std::endl;
-    
     return data;
 }
 
-void PVFinder_t::set_arguments_size(ArgumentReferences<Parameters> arguments, const RuntimeOptions&, const Constants&) const
-{
+void PVFinder_t::set_arguments_size(ArgumentReferences<Parameters> arguments, const RuntimeOptions&, const Constants&) const {
     set_size<dev_pv_positions_t>(arguments, first<host_number_of_events_t>(arguments) * 100);
     set_size<dev_pv_number_t>(arguments, first<host_number_of_events_t>(arguments));
     set_size<dev_output_histogram_t>(arguments, first<host_number_of_events_t>(arguments) * 100);
@@ -42,6 +101,7 @@ void PVFinder_t::set_arguments_size(ArgumentReferences<Parameters> arguments, co
     set_size<dev_layer_sizes_t>(arguments, MAX_LAYERS + 1);
     set_size<dev_input_mean_t>(arguments, 9);
     set_size<dev_input_std_t>(arguments, 9);
+    set_size<dev_ellipsoid_params_t>(arguments, first<host_number_of_events_t>(arguments) * 256 * 6);  // Assuming max 256 tracks per event
 }
 
 void PVFinder_t::operator()(
@@ -54,9 +114,6 @@ void PVFinder_t::operator()(
     
     auto start = std::chrono::high_resolution_clock::now();
     auto [total_weights_size, total_biases_size] = load_model_parameters(arguments);
-
-
-    load_model_parameters(arguments);
     
     auto load_end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> load_time = load_end - start;
@@ -85,19 +142,35 @@ void PVFinder_t::operator()(
         input_std.size() * sizeof(float),
         Allen::memcpyHostToDevice);
 
-    
     global_function(pv_finder_kernel)(
         dim3(first<host_number_of_events_t>(arguments)), dim3(256), context)(arguments);
     
+    // Copy parameters back to host
+    unsigned num_events = first<host_number_of_events_t>(arguments);
+    unsigned max_tracks = 256;  // Assuming max 256 tracks per event
+
+    std::vector<float> ellipsoid_params(num_events * max_tracks * 6);
+    std::vector<float> major_axes(num_events * max_tracks * 3);
+    std::vector<float> minor_axes(num_events * max_tracks * 6);
+    std::vector<float> poca_coords(num_events * max_tracks * 3);
+
+    Allen::memcpy(ellipsoid_params.data(), data<dev_ellipsoid_params_t>(arguments), 
+                  ellipsoid_params.size() * sizeof(float), Allen::memcpyDeviceToHost);
+    Allen::memcpy(major_axes.data(), data<dev_major_axes_t>(arguments), 
+                  major_axes.size() * sizeof(float), Allen::memcpyDeviceToHost);
+    Allen::memcpy(minor_axes.data(), data<dev_minor_axes_t>(arguments), 
+                  minor_axes.size() * sizeof(float), Allen::memcpyDeviceToHost);
+    Allen::memcpy(poca_coords.data(), data<dev_poca_coords_t>(arguments), 
+                  poca_coords.size() * sizeof(float), Allen::memcpyDeviceToHost);
+
+    // Save extended parameters to CSV
+    save_extended_params_to_csv("extended_params.csv", ellipsoid_params, major_axes, minor_axes, poca_coords, num_events, max_tracks);
+
     auto kernel_end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> kernel_time = kernel_end - load_end;
     std::cout << "PVFinder: Kernel execution complete. Time taken: " << kernel_time.count() << " seconds" << std::endl;
     
     // Debug output
-    unsigned num_events = first<host_number_of_events_t>(arguments);
-    std::cout << "PVFinder: Processed " << num_events << " events" << std::endl;
-    
-    // Transfer data from device to host
     std::vector<float> pv_positions(num_events * 100);
     std::vector<unsigned> pv_numbers(num_events);
     std::vector<float> output_histogram(num_events * 100);
@@ -105,30 +178,49 @@ void PVFinder_t::operator()(
     Allen::memcpy(pv_positions.data(), data<dev_pv_positions_t>(arguments), pv_positions.size() * sizeof(float), Allen::memcpyDeviceToHost);
     Allen::memcpy(pv_numbers.data(), data<dev_pv_number_t>(arguments), pv_numbers.size() * sizeof(unsigned), Allen::memcpyDeviceToHost);
     Allen::memcpy(output_histogram.data(), data<dev_output_histogram_t>(arguments), output_histogram.size() * sizeof(float), Allen::memcpyDeviceToHost);
-    
-    // // Output the results
-    // std::ofstream outfile("pv_finder_output.txt");
-    
-    // for (unsigned i = 0; i < std::min(num_events, 5u); ++i) {
-    //     unsigned num_pvs = pv_numbers[i];
-    //     outfile << "Event " << i << ": " << num_pvs << " PVs found" << std::endl;
-    //     for (unsigned j = 0; j < std::min(num_pvs, 5u); ++j) {
-    //         outfile << "  PV " << j << ": " << pv_positions[i*100 + j] << std::endl;
-    //     }
-    //     outfile << "  Histogram:" << std::endl;
-    //     for (unsigned j = 0; j < 100; ++j) {
-    //         outfile << "    Bin " << j << ": " << output_histogram[i*100 + j] << std::endl;
-    //     }
-    //     outfile << std::endl;
-    // }
-    
-    // outfile.close();
-    
-    // std::cout << "PVFinder: Output written to pv_finder_output.txt" << std::endl;
-    
+
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> total_time = end - start;
     std::cout << "PVFinder: Total execution time: " << total_time.count() << " seconds" << std::endl;
+}
+
+__device__ float3 normalize(float3 v) {
+    float mag = sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
+    if (mag > 0.0f) {
+        return make_float3(v.x / mag, v.y / mag, v.z / mag);
+    } else {
+        return make_float3(0.0f, 0.0f, 0.0f);
+    }
+}
+
+__device__ float3 cross(float3 a, float3 b) {
+    return make_float3(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+    );
+}
+
+__device__ float dot(float3 a, float3 b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+__device__ bool state_poca(
+    const Allen::Views::Physics::KalmanState& state,
+    const BeamLine& beam_line,
+    float& poca_x, float& poca_y, float& poca_z)
+{
+    float dz = -state.z();
+    float dx = state.x() + dz * state.tx();
+    float dy = state.y() + dz * state.ty();
+
+    poca_x = dx;
+    poca_y = dy;
+    poca_z = 0.f;
+
+    float distance = sqrtf(dx * dx + dy * dy);
+
+    return distance < 1000.f;
 }
 
 __device__ void get_reco_resolution(
@@ -157,18 +249,24 @@ __device__ void get_reco_resolution(
     }
 }
 
+
 std::pair<size_t, size_t> PVFinder_t::load_model_parameters(const ArgumentReferences<Parameters>& arguments) const {
-    const std::string base_path = "/data/home/melashri/iris/debug-allen/non-Allen/closure_test/model_parameters/model_parameters_txt/";
+    const char* home = getenv("HOME");
+    if (!home) {
+        throw std::runtime_error("Unable to find HOME environment variable.");
+    }
+
+    const std::string base_path = std::string(home) + "/allen_work/Allen/device/pvfinder/include/model_parameters";
     std::vector<float> all_weights;
     std::vector<float> all_biases;
-    
+
     // Initialize total weights and biases size
     size_t total_weights_size = 0;
     size_t total_biases_size = 0;
 
     for (int i = 1; i <= 6; ++i) {
-        std::string weight_file = base_path + "layer" + std::to_string(i) + ".weight.txt";
-        std::string bias_file = base_path + "layer" + std::to_string(i) + ".bias.txt";
+        std::string weight_file = base_path + "/layer" + std::to_string(i) + ".weight.txt";
+        std::string bias_file = base_path + "/layer" + std::to_string(i) + ".bias.txt";
 
         std::vector<float> weights = read_txt_file(weight_file);
         std::vector<float> biases = read_txt_file(bias_file);
@@ -176,12 +274,6 @@ std::pair<size_t, size_t> PVFinder_t::load_model_parameters(const ArgumentRefere
         // Verify the dimensions
         unsigned expected_weight_size = layer_sizes[i-1] * layer_sizes[i];
         unsigned expected_bias_size = layer_sizes[i];
-        
-        std::cout << "Layer " << i << ":" << std::endl;
-        std::cout << "  Expected weight size: " << expected_weight_size << std::endl;
-        std::cout << "  Actual weight size: " << weights.size() << std::endl;
-        std::cout << "  Expected bias size: " << expected_bias_size << std::endl;
-        std::cout << "  Actual bias size: " << biases.size() << std::endl;
 
         if (weights.size() != expected_weight_size || biases.size() != expected_bias_size) {
             throw std::runtime_error("Unexpected dimensions for layer " + std::to_string(i) +
@@ -219,25 +311,16 @@ std::pair<size_t, size_t> PVFinder_t::load_model_parameters(const ArgumentRefere
         layer_sizes.size() * sizeof(unsigned),
         Allen::memcpyHostToDevice);
 
-    std::cout << "PVFinder: Loaded " << all_weights.size() << " weights and " << all_biases.size() << " biases" << std::endl;
-    for (int i = 0; i < 7; ++i) {
-        std::cout << "Layer " << i << ": " << layer_sizes[i] << " neurons" << std::endl;
-    }
-
-    std::cout << "Total weights size: " << total_weights_size << std::endl;
-    std::cout << "Total biases size: " << total_biases_size << std::endl;
-
     return {total_weights_size, total_biases_size};
 }
 
-__device__ void assign_intervals(float z_poca, int* intervals, int& num_intervals)
-{
+__device__ void assign_intervals(float z_poca, int* intervals, int* num_intervals) {
     // Shift z_poca to [0, 400] range for easier interval calculation
     z_poca += 100.0f;
 
     // Handle edge cases: z_poca outside [0, 400] range
     if (z_poca < 0.0f || z_poca > 400.0f) {
-        num_intervals = 1;
+        *num_intervals = 1;
         intervals[0] = z_poca < 0.0f ? 0 : 39;
         return;
     }
@@ -245,116 +328,104 @@ __device__ void assign_intervals(float z_poca, int* intervals, int& num_interval
     // Calculate base interval
     float interval_float = z_poca / 10.0f;
     int base_interval = floorf(interval_float);
-    
-    num_intervals = 0;
+
+    *num_intervals = 0;
 
     // Check if z_poca is within OVERLAP_WIDTH of lower boundary
     if (interval_float - base_interval <= OVERLAP_WIDTH && base_interval > 0) {
-        intervals[num_intervals++] = base_interval - 1;
+        intervals[(*num_intervals)++] = base_interval - 1;
     }
 
     // Always add the base interval
-    intervals[num_intervals++] = base_interval;
+    intervals[(*num_intervals)++] = base_interval;
 
     // Check if z_poca is within OVERLAP_WIDTH of upper boundary
     if (base_interval + 1 - interval_float <= OVERLAP_WIDTH && base_interval < 39) {
-        intervals[num_intervals++] = base_interval + 1;
+        intervals[(*num_intervals)++] = base_interval + 1;
     }
 
     // Ensure all intervals are within [0, 39]
-    for (int i = 0; i < num_intervals; ++i) {
+    for (int i = 0; i < *num_intervals; ++i) {
         intervals[i] = min(39, max(0, intervals[i]));
     }
 }
 
-__device__ void normalize_input(float* input, const float* mean, const float* std)
-{
+__device__ void normalize_input(float* input, const float* mean, const float* std) {
     for (int i = 0; i < 9; ++i) {
         input[i] = (input[i] - mean[i]) / std[i];
     }
 }
 
-
-
-  __device__ void calculate_ellipsoid_params(
-    float x, float y, float z, float tx, float ty,
-    float c00, float c20, float c22, float c11, float c31, float c33,
-    float* ellipsoid_params)
-  {
-    // Construct the covariance matrix
-    float cov[3][3] = {
-        {c00, c20, c31},
-        {c20, c11, c31},
-        {c31, c31, c33}
-    };
-
-    // Add a small regularization term to improve numerical stability
-    const float epsilon = 1e-8f;
-    for (int i = 0; i < 3; ++i) {
-        cov[i][i] += epsilon;
-    }
-
-    // Invert the matrix using Gauss-Jordan elimination
-    float inv[3][3] = {{1,0,0}, {0,1,0}, {0,0,1}}; // Start with identity matrix
-
-    // Perform Gauss-Jordan elimination
-    for (int i = 0; i < 3; ++i) {
-        // Find the pivot
-        int pivot = i;
-        for (int j = i + 1; j < 3; ++j) {
-            if (fabsf(cov[j][i]) > fabsf(cov[pivot][i])) {
-                pivot = j;
-            }
-        }
-
-        // Swap rows if necessary
-        if (pivot != i) {
-            for (int j = 0; j < 3; ++j) {
-                float temp = cov[i][j];
-                cov[i][j] = cov[pivot][j];
-                cov[pivot][j] = temp;
-
-                temp = inv[i][j];
-                inv[i][j] = inv[pivot][j];
-                inv[pivot][j] = temp;
-            }
-        }
-
-        // Scale row to have a 1 on the diagonal
-        float scale = 1.0f / cov[i][i];
-        for (int j = 0; j < 3; ++j) {
-            cov[i][j] *= scale;
-            inv[i][j] *= scale;
-        }
-
-        // Subtract this row from all other rows
-        for (int k = 0; k < 3; ++k) {
-            if (k != i) {
-                float factor = cov[k][i];
-                for (int j = 0; j < 3; ++j) {
-                    cov[k][j] -= factor * cov[i][j];
-                    inv[k][j] -= factor * inv[i][j];
-                }
-            }
-        }
-    }
-
-    // Assign the results to ellipsoid parameters
-    ellipsoid_params[0] = inv[0][0];
-    ellipsoid_params[1] = inv[1][1];
-    ellipsoid_params[2] = inv[2][2];
-    ellipsoid_params[3] = inv[0][1];
-    ellipsoid_params[4] = inv[0][2];
-    ellipsoid_params[5] = inv[1][2];
-  }
-
-__device__ float leaky_relu(float x)
+__device__ void calculate_ellipsoid_params(
+    const Allen::Views::Physics::KalmanState& state,
+    float* ellipsoid_params,
+    float* major_axis,
+    float* minor_axes,
+    float& poca_x, float& poca_y, float& poca_z,
+    unsigned event_number,
+    unsigned track_index)
 {
+    BeamLine beam_line;
+
+    bool poca_success = state_poca(state, beam_line, poca_x, poca_y, poca_z);
+    if (!poca_success) {
+        poca_x = poca_y = poca_z = 0.0f;
+        for (int i = 0; i < 6; ++i) ellipsoid_params[i] = 0.0f;
+        for (int i = 0; i < 3; ++i) major_axis[i] = 0.0f;
+        for (int i = 0; i < 6; ++i) minor_axes[i] = 0.0f;
+        return;
+    }
+
+    float3 center = make_float3(poca_x, poca_y, poca_z);
+    float3 track_dir = normalize(make_float3(state.tx(), state.ty(), 1.0f));
+
+    float3 zhat = normalize(center);
+    float3 xhat = track_dir;
+    float3 yhat = normalize(cross(zhat, xhat));
+
+    float road_error = sqrtf(state.c00());
+
+    float3 u1 = make_float3(road_error * zhat.x, road_error * zhat.y, road_error * zhat.z);
+    float3 u2 = make_float3(road_error * yhat.x, road_error * yhat.y, road_error * yhat.z);
+
+    float arg = dot(xhat, track_dir);
+    arg = fminf(arg, 0.9999f);
+    float u3_scale = (road_error * arg) / sqrtf(1.0f - arg * arg);
+    float3 u3 = make_float3(u3_scale * xhat.x, u3_scale * xhat.y, u3_scale * xhat.z);
+
+    // Store ellipsoid parameters (A-F)
+    ellipsoid_params[0] = u1.x * u1.x + u2.x * u2.x + u3.x * u3.x;
+    ellipsoid_params[1] = u1.y * u1.y + u2.y * u2.y + u3.y * u3.y;
+    ellipsoid_params[2] = u1.z * u1.z + u2.z * u2.z + u3.z * u3.z;
+    ellipsoid_params[3] = u1.x * u1.y + u2.x * u2.y + u3.x * u3.y;
+    ellipsoid_params[4] = u1.x * u1.z + u2.x * u2.z + u3.x * u3.z;
+    ellipsoid_params[5] = u1.y * u1.z + u2.y * u2.z + u3.y * u3.z;
+
+    // Store major axis (u3)
+    major_axis[0] = u3.x;
+    major_axis[1] = u3.y;
+    major_axis[2] = u3.z;
+
+    // Store minor axes (u1 and u2)
+    minor_axes[0] = u1.x;
+    minor_axes[1] = u1.y;
+    minor_axes[2] = u1.z;
+    minor_axes[3] = u2.x;
+    minor_axes[4] = u2.y;
+    minor_axes[5] = u2.z;
+
+    // Debug output
+    if (event_number == 0 && track_index < 3) {
+        printf("Track %d: u1 = (%.6f, %.6f, %.6f)\n", track_index, u1.x, u1.y, u1.z);
+        printf("Track %d: u2 = (%.6f, %.6f, %.6f)\n", track_index, u2.x, u2.y, u2.z);
+        printf("Track %d: u3 = (%.6f, %.6f, %.6f)\n", track_index, u3.x, u3.y, u3.z);
+    }
+}
+__device__ float leaky_relu(float x) {
     return x > 0 ? x : 0.01f * x;
 }
 
-__device__ float softplus(float x)
-{
+__device__ float softplus(float x) {
     const float THRESHOLD = 20.0f;
     if (x > THRESHOLD) {
         return x;
@@ -412,18 +483,13 @@ __device__ void pv_locations_updated_res(
     }
 }
 
-__device__ void neural_network_forward(const float* input, float* output, const float* weights, const float* biases, const unsigned* layer_sizes)
-{
+__device__ void neural_network_forward(const float* input, float* output, const float* weights, const float* biases, const unsigned* layer_sizes) {
     float layer_input[20];  // Max size of any hidden layer
     float layer_output[100];  // Size of the output layer
 
     // Copy input to layer_input
     for (int i = 0; i < 9; ++i) {
         layer_input[i] = input[i];
-        // Debug print
-        if (threadIdx.x == 0 && blockIdx.x == 0) {
-            printf("Input %d: %f\n", i, input[i]);
-        }
     }
 
     int weight_offset = 0;
@@ -459,9 +525,7 @@ __device__ void neural_network_forward(const float* input, float* output, const 
     }
 }
 
-
-__global__ void pv_finder_kernel(Parameters parameters)
-{
+__global__ void pv_finder_kernel(Parameters parameters) {
     const unsigned event_number = blockIdx.x;
     const unsigned thread_id = threadIdx.x;
 
@@ -475,23 +539,72 @@ __global__ void pv_finder_kernel(Parameters parameters)
     // Shared memory for intermediate results
     __shared__ float s_interval_data[256 * 9];  // Assuming max 256 threads per block
 
+    // Base pointers for various parameters in global memory
+    float* ellipsoid_params_base = parameters.dev_ellipsoid_params + event_number * 256 * 6;
+    float* major_axes_base = parameters.dev_major_axes + event_number * 256 * 3;
+    float* minor_axes_base = parameters.dev_minor_axes + event_number * 256 * 6;
+    float* poca_coords_base = parameters.dev_poca_coords + event_number * 256 * 3;
+
+
     // Step 1: Indexing and preprocessing
     for (unsigned i = thread_id; i < num_tracks; i += blockDim.x) {
         const auto track = velo_tracks_view.track(i);
         const auto state = velo_states_view.state(track.track_index());
 
         float ellipsoid_params[6];
-        calculate_ellipsoid_params(
-            state.x(), state.y(), state.z(), state.tx(), state.ty(),
-            state.c00(), state.c20(), state.c22(), state.c11(), state.c31(), state.c33(),
-            ellipsoid_params);
+        float major_axis[3];
+        float minor_axes[6];
+        float poca_x, poca_y, poca_z;
 
+        calculate_ellipsoid_params(
+            state,
+            ellipsoid_params,
+            major_axis,
+            minor_axes,
+            poca_x, poca_y, poca_z,
+            event_number,
+            i);
+        // Debug output
+        if (event_number == 0 && i < 10) {
+            printf("Track %d: A-F = %.6f, %.6f, %.6f, %.6f, %.6f, %.6f\n", 
+                   i, ellipsoid_params[0], ellipsoid_params[1], ellipsoid_params[2],
+                   ellipsoid_params[3], ellipsoid_params[4], ellipsoid_params[5]);
+            printf("Track %d: Major axis = %.6f, %.6f, %.6f\n", 
+                   i, major_axis[0], major_axis[1], major_axis[2]);
+            printf("Track %d: Minor axes = %.6f, %.6f, %.6f, %.6f, %.6f, %.6f\n", 
+                   i, minor_axes[0], minor_axes[1], minor_axes[2],
+                   minor_axes[3], minor_axes[4], minor_axes[5]);
+        }            
         // Store preprocessed data in shared memory
-        s_interval_data[thread_id * 9 + 0] = state.x();
-        s_interval_data[thread_id * 9 + 1] = state.y();
-        s_interval_data[thread_id * 9 + 2] = state.z();
+        s_interval_data[thread_id * 9 + 0] = poca_x;
+        s_interval_data[thread_id * 9 + 1] = poca_y;
+        s_interval_data[thread_id * 9 + 2] = poca_z;
         for (int j = 0; j < 6; ++j) {
             s_interval_data[thread_id * 9 + 3 + j] = ellipsoid_params[j];
+        }
+
+        // Store data in global memory
+        for (int j = 0; j < 6; ++j) {
+            ellipsoid_params_base[i * 6 + j] = ellipsoid_params[j];
+        }
+        for (int j = 0; j < 3; ++j) {
+            major_axes_base[i * 3 + j] = major_axis[j];
+        }
+        for (int j = 0; j < 6; ++j) {
+            minor_axes_base[i * 6 + j] = minor_axes[j];
+        }
+        poca_coords_base[i * 3 + 0] = poca_x;
+        poca_coords_base[i * 3 + 1] = poca_y;
+        poca_coords_base[i * 3 + 2] = poca_z;        // Assign intervals based on z_poca
+
+        int intervals[3];
+        int num_intervals;
+        assign_intervals(poca_z, intervals, &num_intervals);
+
+        // Store interval information (you may need to adjust this based on your data structures)
+        parameters.dev_interval_counts[event_number * num_tracks + i] = num_intervals;
+        for (int j = 0; j < num_intervals; ++j) {
+            parameters.dev_intervals[(event_number * num_tracks + i) * 3 + j] = intervals[j];
         }
     }
 
@@ -531,12 +644,12 @@ __global__ void pv_finder_kernel(Parameters parameters)
         // Store results
         float* dev_pv_positions = parameters.dev_pv_positions + event_number * 100;
         unsigned* dev_pv_number = parameters.dev_pv_number + event_number;
-        
+
         for (int i = 0; i < num_pvs; ++i) {
             dev_pv_positions[i] = pv_locations[i] * 0.1f - 100.0f;  // Convert bin to z position
         }
         *dev_pv_number = num_pvs;
-        
+
         printf("PVFinder Kernel: Event %d processed. Found %d PVs\n", event_number, num_pvs);
     }
 }

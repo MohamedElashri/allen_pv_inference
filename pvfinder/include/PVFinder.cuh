@@ -1,3 +1,14 @@
+/*****************************************************************************\
+* (c) Copyright 2018-2020 CERN for the benefit of the LHCb Collaboration      *
+*                                                                             *
+* This software is distributed under the terms of the Apache License          *
+* version 2 (Apache-2.0), copied verbatim in the file "LICENSE".              *
+*                                                                             *
+* In applying this licence, CERN does not waive the privileges and immunities *
+* granted to it by virtue of its status as an Intergovernmental Organization  *
+* or submit itself to any jurisdiction.                                       *
+\*****************************************************************************/
+
 #pragma once
 
 #include "AlgorithmTypes.cuh"
@@ -9,7 +20,15 @@ namespace PVFinder {
   constexpr unsigned MAX_LAYERS = 6;
   constexpr unsigned MAX_LAYER_SIZE = 100;
 
-struct Parameters {
+  struct BeamLine {
+    __host__ __device__ float x() const { return 0.f; }
+    __host__ __device__ float y() const { return 0.f; }
+    __host__ __device__ float z() const { return 0.f; }
+    __host__ __device__ float tx() const { return 0.f; }
+    __host__ __device__ float ty() const { return 0.f; }
+  };
+
+  struct Parameters {
     HOST_INPUT(host_number_of_events_t, unsigned) host_number_of_events;
     DEVICE_INPUT(dev_number_of_events_t, unsigned) dev_number_of_events;
     DEVICE_INPUT(dev_velo_tracks_view_t, Allen::Views::Velo::Consolidated::Tracks) dev_velo_tracks_view;
@@ -22,8 +41,14 @@ struct Parameters {
     DEVICE_OUTPUT(dev_layer_sizes_t, unsigned) dev_layer_sizes;
     DEVICE_OUTPUT(dev_input_mean_t, float) dev_input_mean;
     DEVICE_OUTPUT(dev_input_std_t, float) dev_input_std;
+    DEVICE_OUTPUT(dev_ellipsoid_params_t, float) dev_ellipsoid_params;  // Array to hold ellipsoid params (A-F)
+    DEVICE_OUTPUT(dev_major_axes_t, float) dev_major_axes;
+    DEVICE_OUTPUT(dev_minor_axes_t, float) dev_minor_axes;
+    DEVICE_OUTPUT(dev_poca_coords_t, float) dev_poca_coords;
+    DEVICE_OUTPUT(dev_intervals_t, int) dev_intervals;
+    DEVICE_OUTPUT(dev_interval_counts_t, int) dev_interval_counts;
     PROPERTY(block_dim_t, "block_dim", "block dimensions", DeviceDimensions) block_dim;
-};
+  };
 
   __global__ void pv_finder_kernel(Parameters parameters);
 
@@ -42,11 +67,19 @@ struct Parameters {
   };
 
   // Helper functions
-  __device__ void assign_intervals(float z_poca, int* intervals, int& num_intervals);
+  __device__ void assign_intervals(float z_poca, int* intervals, int* num_intervals);
+  __device__ bool state_poca(
+    const Allen::Views::Physics::KalmanState& state,
+    const BeamLine& beam_line,
+    float& poca_x, float& poca_y, float& poca_z);
   __device__ void calculate_ellipsoid_params(
-    float x, float y, float z, float tx, float ty,
-    float c00, float c20, float c22, float c11, float c31, float c33,
-    float* ellipsoid_params);
+    const Allen::Views::Physics::KalmanState& state,
+    float* ellipsoid_params,
+    float* major_axis,
+    float* minor_axes,
+    float& poca_x, float& poca_y, float& poca_z,
+    unsigned event_number,
+    unsigned track_index);
   __device__ float leaky_relu(float x);
   __device__ float softplus(float x);
   __device__ void neural_network_forward(const float* input, float* output, const float* weights, const float* biases, const unsigned* layer_sizes);
@@ -63,4 +96,10 @@ struct Parameters {
     int num_pvs,
     float* output_histogram,
     float* resolutions);
-}
+
+  // Vector operation helper functions
+  __device__ float3 normalize(float3 v);
+  __device__ float3 cross(float3 a, float3 b);
+  __device__ float dot(float3 a, float3 b);
+
+} // namespace PVFinder
